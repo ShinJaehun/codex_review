@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# send_dump
+#
+# 목적:
+# - 특정 디렉토리의 파일 내용을 하나의 dump 파일로 생성한 뒤
+#   원격 CODEX_REVIEW_TARGET_DIR 로 scp 전송합니다.
+#
+# 현재 지원 옵션:
+# - --exclude-dir, -ed : 제외할 디렉토리명(csv)
+# - --maxdepth, -m     : find maxdepth
+
+load_config() {
+  local cfg="${CODEX_REVIEW_CONFIG:-$HOME/.config/codex_review/config}"
+  if [[ -f "$cfg" ]]; then
+    # shellcheck disable=SC1090
+    source "$cfg"
+  fi
+}
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: send_dump <directory> [options]
+
+Options:
+  -ed, --exclude-dir <csv>   Exclude directory names (e.g. bin,__pycache__,node_modules)
+  -m,  --maxdepth <n>        Limit recursive depth
+
+Examples:
+  send_dump app
+  send_dump src -ed bin,__pycache__
+  send_dump app -m 1
+  send_dump app -ed bin,tmp -m 2
+EOF
+}
+
+require_var() {
+  local name="$1"
+  local val="${!name:-}"
+  if [[ -z "$val" ]]; then
+    echo "Error: missing required config var: $name" >&2
+    exit 1
+  fi
+}
+
+sanitize_path() {
+  local p="$1"
+  p="${p#./}"
+  p="${p//\//_}"
+  p="${p// /_}"
+  printf '%s' "$p"
+}
+
+join_csv_for_name() {
+  local s="$1"
+  s="${s//,/--}"
+  s="${s// /_}"
+  printf '%s' "$s"
+}
+
+main() {
+  load_config
+
+  local target_dir=""
+  local exclude_dirs=""
+  local maxdepth=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -ed|--exclude-dir)
+        if [[ $# -lt 2 ]]; then
+          echo "Error: missing value for $1" >&2
+          usage
+          exit 1
+        fi
+        exclude_dirs="$2"
+        shift 2
+        ;;
+      -m|--maxdepth)
+        if [[ $# -lt 2 ]]; then
+          echo "Error: missing value for $1" >&2
+          usage
+          exit 1
+        fi
+        maxdepth="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -*)
+        echo "Error: unknown option: $1" >&2
+        usage
+        exit 1
+        ;;
+      *)
+        if [[ -n "$target_dir" ]]; then
+          echo "Error: only one target directory is supported." >&2
+          usage
+          exit 1
+        fi
+        target_dir="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$target_dir" ]]; then
+    usage
+    exit 1
+  fi
+
+  require_var CODEX_REVIEW_TARGET_USER
+  require_var CODEX_REVIEW_TARGET_HOST
+  require_var CODEX_REVIEW_TARGET_DIR
+
+  if [[ ! -d "$target_dir" ]]; then
+    echo "Error: directory not found: $target_dir" >&2
+    exit 1
+  fi
+
+  local out_dir="${CODEX_REVIEW_DUMP_OUT_DIR:-${CODEX_REVIEW_OUT_DIR:-/tmp}}"
+  mkdir -p "$out_dir"
+
+  local ts
+  ts="$(date +%Y%m%d_%H%M%S)"
+
+  local safe_dir
+  safe_dir="$(sanitize_path "$target_dir")"
+
+  local suffix=""
+  [[ -n "$exclude_dirs" ]] && suffix="${suffix}_ed_$(join_csv_for_name "$exclude_dirs")"
+  [[ -n "$maxdepth" ]] && suffix="${suffix}_m_${maxdepth}"
+
+  local out="${out_dir%/}/${ts}_dump_${safe_dir}${suffix}.txt"
+
+  local -a find_cmd
+  find_cmd=(find "$target_dir")
+
+  if [[ -n "$maxdepth" ]]; then
+    find_cmd+=(-maxdepth "$maxdepth")
+  fi
+
+  if [[ -n "$exclude_dirs" ]]; then
+    IFS=',' read -r -a exclude_arr <<< "$exclude_dirs"
+    find_cmd+=(-type d '(')
+    local first=1
+    local d
+    for d in "${exclude_arr[@]}"; do
+      [[ -z "$d" ]] && continue
+      if [[ $first -eq 0 ]]; then
+        find_cmd+=(-o)
+      fi
+      find_cmd+=(-name "$d")
+      first=0
+    done
+    find_cmd+=(')' -prune -o)
+  fi
+
+  find_cmd+=(-type f -print)
+
+  {
+    "${find_cmd[@]}" | while IFS= read -r file; do
+      echo "==== $file ===="
+      cat "$file"
+      echo
+    done
+  } > "$out"
+
+  if [[ ! -f "$out" ]]; then
+    echo "Error: failed to create dump file: $out" >&2
+    exit 1
+  fi
+
+  echo "Sending: $out" >&2
+  echo "To     : ${CODEX_REVIEW_TARGET_USER}@${CODEX_REVIEW_TARGET_HOST}:${CODEX_REVIEW_TARGET_DIR}" >&2
+
+  ssh "${CODEX_REVIEW_TARGET_USER}@${CODEX_REVIEW_TARGET_HOST}" \
+    "mkdir -p ${CODEX_REVIEW_TARGET_DIR}"
+
+  scp "$out" \
+    "${CODEX_REVIEW_TARGET_USER}@${CODEX_REVIEW_TARGET_HOST}:${CODEX_REVIEW_TARGET_DIR}/"
+
+  echo "$out"
+}
+
+main "$@"
