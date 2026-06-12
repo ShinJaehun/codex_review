@@ -544,3 +544,9 @@ spec → 구현 → review or dump → 토론 → 다음 spec
 - 변경사항 리뷰면 `send_review`
 - 파일 본문 컨텍스트면 `send_dump`
 - 둘 다 필요하면 둘 다 사용
+
+# 저작권
+
+* codex_review는 신재훈이 만들었습니다.
+* codex_review는 GNU GPL을 따릅니다.
+
